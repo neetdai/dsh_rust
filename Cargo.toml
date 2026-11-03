@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/dsh-runtime", "crates/dsh-cordis"]
+resolver = "3"
+
+[package]
+name = "deepseek_harness_rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+dsh-cordis = { path = "crates/dsh-cordis" }
+dsh-runtime = { path = "crates/dsh-runtime", features = ["tokio"] }
+futures = "0.3"
