@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::plugin::PluginError;
-use crate::service::ServiceKey;
+use crate::service::ServiceKeyId;
 
 /// Errors raised by the kernel.
 #[derive(Debug, Clone)]
@@ -12,20 +12,20 @@ pub enum CordisError {
     ServiceAlreadyProvided(&'static str),
     /// A required service is missing.
     MissingService(&'static str),
-    /// The stored service has a different Rust type than requested.
-    ServiceTypeMismatch {
-        /// Service name.
-        key: &'static str,
-        /// The type the caller asked for.
-        expected: &'static str,
-    },
+    /// A plugin config was rejected by its [`ConfigValidator`].
+    ///
+    /// The payload is the validator's error message. Validation happens
+    /// before mounting, so no fiber is created for an invalid config.
+    ///
+    /// [`ConfigValidator`]: crate::ConfigValidator
+    InvalidConfig(String),
     /// Plugin startup failed.
     PluginFailed(PluginError),
 }
 
 impl CordisError {
-    pub(crate) fn missing(key: ServiceKey) -> Self {
-        CordisError::MissingService(key.as_str())
+    pub(crate) fn missing(key: ServiceKeyId) -> Self {
+        CordisError::MissingService(key.name())
     }
 }
 
@@ -37,8 +37,8 @@ impl fmt::Display for CordisError {
                 write!(f, "service `{key}` is already provided in this scope")
             }
             CordisError::MissingService(key) => write!(f, "service `{key}` is not available"),
-            CordisError::ServiceTypeMismatch { key, expected } => {
-                write!(f, "service `{key}` is not a `{expected}`")
+            CordisError::InvalidConfig(message) => {
+                write!(f, "invalid plugin config: {message}")
             }
             CordisError::PluginFailed(err) => write!(f, "plugin failed: {err}"),
         }

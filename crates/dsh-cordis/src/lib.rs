@@ -24,9 +24,9 @@ mod service;
 pub use context::Context;
 pub use error::CordisError;
 pub use event::{
-    BailEvent, EmitEvent, Event, EventBus, ListenerHandle, Next, ParallelEvent, SerialEvent,
-    WaterfallEvent,
+    BailEvent, EmitEvent, Event, EventBus, EventOptions, ListenerHandle, Next, ParallelEvent,
+    SerialEvent, WaterfallEvent,
 };
 pub use fiber::{Disposer, EffectHandle, FiberHandle, FiberId, FiberStatus};
-pub use plugin::{Config, FnPlugin, Plugin, PluginError, PluginMeta};
-pub use service::{ServiceEntry, ServiceHandle, ServiceKey};
+pub use plugin::{Config, ConfigValidator, FnPlugin, Plugin, PluginError, PluginMeta};
+pub use service::{ServiceEntry, ServiceHandle, ServiceKey, ServiceKeyId};

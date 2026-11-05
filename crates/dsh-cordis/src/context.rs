@@ -1,4 +1,4 @@
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,13 +7,13 @@ use dsh_runtime::{LocalBoxFuture, Runtime, RuntimeExt, TaskHandle};
 
 use crate::error::CordisError;
 use crate::event::{
-    BailEvent, EmitEvent, EmitFn, EventBus, ListenerHandle, ParallelEvent, SerialEvent,
-    WaterfallEvent,
+    BailEvent, EmitEvent, EventBus, EventKey, EventOptions, ListenerHandle, ParallelEvent,
+    SerialEvent, WaterfallEvent,
 };
 use crate::fiber::{Disposer, EffectHandle, FiberHandle, FiberId, FiberInner, FiberStatus};
 use crate::plugin::{Config, FnPlugin, Plugin, PluginError};
 use crate::registry::Registry;
-use crate::service::{ServiceEntry, ServiceHandle, ServiceKey, ServiceStore};
+use crate::service::{ServiceEntry, ServiceHandle, ServiceKey, ServiceKeyId, ServiceStore};
 
 pub(crate) struct ContextInner {
     parent: Option<Context>,
@@ -80,8 +80,11 @@ impl Context {
 
     /// A child context where `key` is resolved independently from the parent
     /// (Cordis `ctx.isolate(name)`).
-    pub fn isolate(&self, key: ServiceKey) -> Self {
-        let store = ServiceStore::isolate(self.inner.store.clone(), key);
+    pub fn isolate<T>(&self, key: ServiceKey<T>) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        let store = ServiceStore::isolate(self.inner.store.clone(), key.id());
         self.child_with_store(self.inner.fiber.clone(), store)
     }
 
@@ -129,23 +132,21 @@ impl Context {
     /// Services provided by a fiber that has not finished loading are not
     /// visible to other fibers (Cordis activates a service when its provider
     /// fiber becomes active).
-    pub fn get<T>(&self, key: ServiceKey) -> Option<Arc<T>>
+    pub fn get<T>(&self, key: ServiceKey<T>) -> Option<Arc<T>>
     where
         T: Any + Send + Sync,
     {
+        let id = key.id();
         let mut store = self.inner.store.clone();
         loop {
-            let entry = store.services.borrow().get(&key).cloned();
+            let entry = store.services.borrow().get(&id).cloned();
             if let Some(entry) = entry {
-                if entry.type_id != TypeId::of::<T>() {
-                    return None;
-                }
                 if !self.provider_visible(&entry) {
                     return None;
                 }
-                return entry.downcast::<T>();
+                return Some(entry.downcast::<T>());
             }
-            if store.isolated.borrow().contains(&key) {
+            if store.isolated.borrow().contains(&id) {
                 return None;
             }
             store = store.parent.clone()?;
@@ -153,14 +154,15 @@ impl Context {
     }
 
     /// Read a required service or fail with [`CordisError::MissingService`].
-    pub fn require<T>(&self, key: ServiceKey) -> Result<Arc<T>, CordisError>
+    pub fn require<T>(&self, key: ServiceKey<T>) -> Result<Arc<T>, CordisError>
     where
         T: Any + Send + Sync,
     {
-        self.get::<T>(key).ok_or_else(|| CordisError::missing(key))
+        let id = key.id();
+        self.get(key).ok_or_else(|| CordisError::missing(id))
     }
 
-    pub(crate) fn has_active_service(&self, key: ServiceKey) -> bool {
+    pub(crate) fn has_active_service(&self, key: ServiceKeyId) -> bool {
         let mut store = self.inner.store.clone();
         loop {
             let entry = store.services.borrow().get(&key).cloned();
@@ -182,17 +184,22 @@ impl Context {
     /// The service is removed when its disposer runs or when the fiber
     /// unloads. Providing an already-present name in the same scope fails;
     /// use [`Context::isolate`] to override an inherited service.
-    pub fn provide<T>(&self, key: ServiceKey, value: Arc<T>) -> Result<ServiceHandle, CordisError>
+    pub fn provide<T>(
+        &self,
+        key: ServiceKey<T>,
+        value: Arc<T>,
+    ) -> Result<ServiceHandle, CordisError>
     where
-        T: Send + Sync + 'static,
+        T: Any + Send + Sync,
     {
         self.assert_active()?;
+        let id = key.id();
         {
             let mut services = self.inner.store.services.borrow_mut();
-            if services.contains_key(&key) {
-                return Err(CordisError::ServiceAlreadyProvided(key.as_str()));
+            if services.contains_key(&id) {
+                return Err(CordisError::ServiceAlreadyProvided(id.name()));
             }
-            services.insert(key, ServiceEntry::new(value, self.fiber_id()));
+            services.insert(id, ServiceEntry::new(value, self.fiber_id()));
         }
 
         let store = self.inner.store.clone();
@@ -201,14 +208,14 @@ impl Context {
             let store = store.clone();
             let registry = registry.clone();
             Some(Box::new(move || {
-                store.services.borrow_mut().remove(&key);
+                store.services.borrow_mut().remove(&id);
                 registry.service_removed();
             }))
         })?;
 
         // A provisioned service may satisfy pending `inject` declarations.
         self.inner.registry.service_added();
-        Ok(ServiceHandle { effect, key })
+        Ok(ServiceHandle { effect, key: id })
     }
 
     /// Register a cleanup-aware effect on this fiber.
@@ -228,14 +235,8 @@ impl Context {
         })
     }
 
-    fn add_emit<E: EmitEvent>(
-        &self,
-        f: EmitFn<E>,
-        prepend: bool,
-        once: bool,
-    ) -> Result<ListenerHandle, CordisError> {
-        self.assert_active()?;
-        let (key, id) = self.inner.events.add_emit::<E>(f, prepend, once);
+    /// Register a listener and tie its removal to the current fiber.
+    fn track_listener(&self, key: EventKey, id: u64) -> Result<ListenerHandle, CordisError> {
         let bus = self.inner.events.clone();
         let effect = self.effect({
             let bus = bus.clone();
@@ -253,12 +254,36 @@ impl Context {
         Ok(ListenerHandle::new(bus, key, id))
     }
 
-    /// Register an `emit` listener.
+    /// Register an `emit` listener with explicit [`EventOptions`].
+    pub fn on_with<E: EmitEvent>(
+        &self,
+        options: EventOptions,
+        f: impl Fn(E::Args) + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.assert_active()?;
+        let (key, id) = self
+            .inner
+            .events
+            .add_emit::<E>(Rc::new(f), options.prepend, options.once);
+        self.track_listener(key, id)
+    }
+
+    /// Register an `emit` listener; alias of [`Context::on_with`] that names
+    /// the event mode explicitly.
+    pub fn on_emit_with<E: EmitEvent>(
+        &self,
+        options: EventOptions,
+        f: impl Fn(E::Args) + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.on_with::<E>(options, f)
+    }
+
+    /// Register an `emit` listener (tail of the chain, until disposed).
     pub fn on<E: EmitEvent>(
         &self,
         f: impl Fn(E::Args) + 'static,
     ) -> Result<ListenerHandle, CordisError> {
-        self.add_emit::<E>(Rc::new(f), false, false)
+        self.on_with::<E>(EventOptions::default(), f)
     }
 
     /// Register an `emit` listener that disposes itself after its first call.
@@ -266,107 +291,108 @@ impl Context {
         &self,
         f: impl Fn(E::Args) + 'static,
     ) -> Result<ListenerHandle, CordisError> {
-        self.add_emit::<E>(Rc::new(f), false, true)
+        self.on_with::<E>(
+            EventOptions {
+                once: true,
+                ..EventOptions::default()
+            },
+            f,
+        )
     }
 
-    /// Register a `waterfall` listener. The listener may call
-    /// [`crate::Next::next`] or return without it to veto the chain.
+    /// Register a `waterfall` listener with explicit [`EventOptions`].
+    ///
+    /// The listener may call [`crate::Next::next`] or return without it to
+    /// veto the chain. With `once`, it takes part in the first dispatch only.
+    pub fn on_waterfall_with<E: WaterfallEvent>(
+        &self,
+        options: EventOptions,
+        f: impl Fn(E::Args, crate::Next<E>) -> LocalBoxFuture<'static, E::Out> + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.assert_active()?;
+        let (key, id) =
+            self.inner
+                .events
+                .add_waterfall::<E>(Rc::new(f), options.prepend, options.once);
+        self.track_listener(key, id)
+    }
+
+    /// Register a `waterfall` listener (tail of the chain, until disposed).
     pub fn on_waterfall<E: WaterfallEvent>(
         &self,
         f: impl Fn(E::Args, crate::Next<E>) -> LocalBoxFuture<'static, E::Out> + 'static,
     ) -> Result<ListenerHandle, CordisError> {
-        self.assert_active()?;
-        let (key, id) = self.inner.events.add_waterfall::<E>(Rc::new(f), false);
-        let bus = self.inner.events.clone();
-        let effect = self.effect({
-            let bus = bus.clone();
-            move || {
-                let bus = bus.clone();
-                Some(Box::new(move || {
-                    bus.remove(key, id);
-                }))
-            }
-        });
-        if let Err(error) = effect {
-            bus.remove(key, id);
-            return Err(error);
-        }
-        Ok(ListenerHandle::new(bus, key, id))
+        self.on_waterfall_with::<E>(EventOptions::default(), f)
     }
 
-    /// Register a `serial` listener. Return `Some(value)` to bail.
+    /// Register a `serial` listener with explicit [`EventOptions`].
+    ///
+    /// Return `Some(value)` to bail.
+    pub fn on_serial_with<E: SerialEvent>(
+        &self,
+        options: EventOptions,
+        f: impl Fn(E::Args) -> LocalBoxFuture<'static, Option<E::Out>> + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.assert_active()?;
+        let (key, id) =
+            self.inner
+                .events
+                .add_serial::<E>(Rc::new(f), options.prepend, options.once);
+        self.track_listener(key, id)
+    }
+
+    /// Register a `serial` listener (tail of the chain, until disposed).
     pub fn on_serial<E: SerialEvent>(
         &self,
         f: impl Fn(E::Args) -> LocalBoxFuture<'static, Option<E::Out>> + 'static,
     ) -> Result<ListenerHandle, CordisError> {
-        self.assert_active()?;
-        let (key, id) = self.inner.events.add_serial::<E>(Rc::new(f), false, false);
-        let bus = self.inner.events.clone();
-        let effect = self.effect({
-            let bus = bus.clone();
-            move || {
-                let bus = bus.clone();
-                Some(Box::new(move || {
-                    bus.remove(key, id);
-                }))
-            }
-        });
-        if let Err(error) = effect {
-            bus.remove(key, id);
-            return Err(error);
-        }
-        Ok(ListenerHandle::new(bus, key, id))
+        self.on_serial_with::<E>(EventOptions::default(), f)
     }
 
-    /// Register a `bail` listener. Return `Some(value)` to bail.
-    pub fn on_bail<E: BailEvent>(
+    /// Register a `bail` listener with explicit [`EventOptions`].
+    ///
+    /// Return `Some(value)` to bail.
+    pub fn on_bail_with<E: BailEvent>(
         &self,
+        options: EventOptions,
         f: impl Fn(E::Args) -> Option<E::Out> + 'static,
-    ) -> Result<ListenerHandle, CordisError> {
-        self.assert_active()?;
-        let (key, id) = self.inner.events.add_bail::<E>(Rc::new(f), false, false);
-        let bus = self.inner.events.clone();
-        let effect = self.effect({
-            let bus = bus.clone();
-            move || {
-                let bus = bus.clone();
-                Some(Box::new(move || {
-                    bus.remove(key, id);
-                }))
-            }
-        });
-        if let Err(error) = effect {
-            bus.remove(key, id);
-            return Err(error);
-        }
-        Ok(ListenerHandle::new(bus, key, id))
-    }
-
-    /// Register a `parallel` listener.
-    pub fn on_parallel<E: ParallelEvent>(
-        &self,
-        f: impl Fn(E::Args) -> LocalBoxFuture<'static, ()> + 'static,
     ) -> Result<ListenerHandle, CordisError> {
         self.assert_active()?;
         let (key, id) = self
             .inner
             .events
-            .add_parallel::<E>(Rc::new(f), false, false);
-        let bus = self.inner.events.clone();
-        let effect = self.effect({
-            let bus = bus.clone();
-            move || {
-                let bus = bus.clone();
-                Some(Box::new(move || {
-                    bus.remove(key, id);
-                }))
-            }
-        });
-        if let Err(error) = effect {
-            bus.remove(key, id);
-            return Err(error);
-        }
-        Ok(ListenerHandle::new(bus, key, id))
+            .add_bail::<E>(Rc::new(f), options.prepend, options.once);
+        self.track_listener(key, id)
+    }
+
+    /// Register a `bail` listener (tail of the chain, until disposed).
+    pub fn on_bail<E: BailEvent>(
+        &self,
+        f: impl Fn(E::Args) -> Option<E::Out> + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.on_bail_with::<E>(EventOptions::default(), f)
+    }
+
+    /// Register a `parallel` listener with explicit [`EventOptions`].
+    pub fn on_parallel_with<E: ParallelEvent>(
+        &self,
+        options: EventOptions,
+        f: impl Fn(E::Args) -> LocalBoxFuture<'static, ()> + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.assert_active()?;
+        let (key, id) =
+            self.inner
+                .events
+                .add_parallel::<E>(Rc::new(f), options.prepend, options.once);
+        self.track_listener(key, id)
+    }
+
+    /// Register a `parallel` listener (tail of the chain, until disposed).
+    pub fn on_parallel<E: ParallelEvent>(
+        &self,
+        f: impl Fn(E::Args) -> LocalBoxFuture<'static, ()> + 'static,
+    ) -> Result<ListenerHandle, CordisError> {
+        self.on_parallel_with::<E>(EventOptions::default(), f)
     }
 
     /// Dispatch an `emit` event.
@@ -444,6 +470,11 @@ impl Context {
     }
 
     /// Mount a plugin with a config value.
+    ///
+    /// The plugin's [`crate::ConfigValidator`] (if any) runs first. An invalid
+    /// config returns [`CordisError::InvalidConfig`] without creating a fiber
+    /// or calling `apply`; a valid config is normalized by the validator before
+    /// it is handed to `apply`.
     pub fn plugin_with_config<P>(
         &self,
         plugin: P,
@@ -453,16 +484,24 @@ impl Context {
         P: Plugin + 'static,
     {
         self.assert_active()?;
+        let config = plugin
+            .meta()
+            .validate_config(config)
+            .map_err(CordisError::InvalidConfig)?;
         Ok(self.inner.registry.mount(self, Rc::new(plugin), config))
     }
 
     /// Cordis `ctx.inject(deps, callback)` shorthand.
-    pub fn inject<F>(&self, deps: &[ServiceKey], callback: F) -> Result<FiberHandle, CordisError>
+    ///
+    /// Accepts any iterable of keys that convert into [`ServiceKeyId`], e.g.
+    /// `ctx.inject([TOOLS], ...)` or `ctx.inject([TOOLS.id()], ...)`.
+    pub fn inject<I, K, F>(&self, deps: I, callback: F) -> Result<FiberHandle, CordisError>
     where
+        I: IntoIterator<Item = K>,
+        K: Into<ServiceKeyId>,
         F: Fn(Context) -> LocalBoxFuture<'static, Result<(), PluginError>> + 'static,
     {
-        let plugin =
-            FnPlugin::new("inject", move |ctx, _config| callback(ctx)).inject(deps.iter().copied());
+        let plugin = FnPlugin::new("inject", move |ctx, _config| callback(ctx)).inject(deps);
         self.plugin(plugin)
     }
 }

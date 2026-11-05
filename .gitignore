@@ -27,3 +27,6 @@ rustc-ice-*.txt
 *.tmp
 tmp-*.out
 tmp-*.err
+
+# AgentTeams runtime state (local task/mailbox snapshots, not source)
+/.agent-teams/

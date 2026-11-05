@@ -9,8 +9,10 @@
 //! | `bail` | no | registration order, bails | first non-`None` |
 //!
 //! Listeners are owned by a fiber through an effect, so unloading a plugin
-//! removes its listeners. `once` listeners are removed after their first call
-//! in the `emit`, `parallel`, `serial` and `bail` modes.
+//! removes its listeners. `once` listeners are removed from the bus when their
+//! first dispatch starts, before any callback runs; that dispatch's snapshot
+//! still runs them at most once, and later or re-entrant dispatches never see
+//! them. This applies to all five modes, including `waterfall`.
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
@@ -51,6 +53,26 @@ pub trait BailEvent: Event {
 
 /// Event dispatched with `ctx.parallel`; all listeners run concurrently.
 pub trait ParallelEvent: Event {}
+
+/// Registration options shared by all five event modes.
+///
+/// `EventOptions::default()` registers at the tail and keeps the listener
+/// until it is disposed. See [`crate::Context::on_with`],
+/// [`crate::Context::on_waterfall_with`], [`crate::Context::on_serial_with`],
+/// [`crate::Context::on_bail_with`] and [`crate::Context::on_parallel_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventOptions {
+    /// Insert the listener at the head of the chain instead of the tail.
+    ///
+    /// With several prepended listeners the most recently prepended one runs
+    /// first (same as `Vec::insert(0, ..)`).
+    pub prepend: bool,
+    /// Remove the listener when its first dispatch starts.
+    ///
+    /// It still takes part in that dispatch, at most once, but never in a later
+    /// or re-entrant dispatch.
+    pub once: bool,
+}
 
 pub(crate) type EmitFn<E> = Rc<dyn Fn(<E as Event>::Args)>;
 pub(crate) type WaterfallFn<E> =
@@ -185,9 +207,10 @@ impl EventBus {
         &self,
         f: WaterfallFn<E>,
         prepend: bool,
+        once: bool,
     ) -> (EventKey, u64) {
         let key = EventKey::new::<E>(EventKind::Waterfall);
-        (key, self.insert(key, f, prepend, false))
+        (key, self.insert(key, f, prepend, once))
     }
 
     pub(crate) fn add_serial<E: SerialEvent>(
@@ -220,15 +243,26 @@ impl EventBus {
         (key, self.insert(key, f, prepend, once))
     }
 
+    /// Remove `once` listeners from the bus before their dispatch starts.
+    ///
+    /// The dispatch's snapshot still holds an `Rc` to each listener, so those
+    /// listeners run in this dispatch (at most once) but re-entrant or later
+    /// dispatches cannot see them again.
+    fn remove_once<F: 'static>(&self, key: EventKey, slots: &[Rc<ListenerSlot<F>>]) {
+        for slot in slots {
+            if slot.once.get() {
+                self.remove(key, slot.id);
+            }
+        }
+    }
+
     /// Synchronously call every listener; return values are ignored.
     pub fn emit<E: EmitEvent>(&self, args: E::Args) {
         let key = EventKey::new::<E>(EventKind::Emit);
         let slots = self.snapshot::<EmitFn<E>>(key);
+        self.remove_once(key, &slots);
         for slot in slots {
             (slot.f)(args.clone());
-            if slot.once.get() {
-                self.remove(key, slot.id);
-            }
         }
     }
 
@@ -236,24 +270,18 @@ impl EventBus {
     pub async fn parallel<E: ParallelEvent>(&self, args: E::Args) {
         let key = EventKey::new::<E>(EventKind::Parallel);
         let slots = self.snapshot::<ParallelFn<E>>(key);
+        self.remove_once(key, &slots);
         let futures = slots.iter().map(|slot| (slot.f)(args.clone()));
         futures::future::join_all(futures).await;
-        for slot in slots {
-            if slot.once.get() {
-                self.remove(key, slot.id);
-            }
-        }
     }
 
     /// Await listeners in registration order, stopping at the first bail.
     pub async fn serial<E: SerialEvent>(&self, args: E::Args) -> Option<E::Out> {
         let key = EventKey::new::<E>(EventKind::Serial);
         let slots = self.snapshot::<SerialFn<E>>(key);
+        self.remove_once(key, &slots);
         for slot in slots {
             let value = (slot.f)(args.clone()).await;
-            if slot.once.get() {
-                self.remove(key, slot.id);
-            }
             if value.is_some() {
                 return value;
             }
@@ -265,11 +293,9 @@ impl EventBus {
     pub fn bail<E: BailEvent>(&self, args: E::Args) -> Option<E::Out> {
         let key = EventKey::new::<E>(EventKind::Bail);
         let slots = self.snapshot::<BailFn<E>>(key);
+        self.remove_once(key, &slots);
         for slot in slots {
             let value = (slot.f)(args.clone());
-            if slot.once.get() {
-                self.remove(key, slot.id);
-            }
             if value.is_some() {
                 return value;
             }
@@ -282,37 +308,77 @@ impl EventBus {
     /// The caller passes the built-in behavior; every listener receives a
     /// [`Next`] that runs the rest of the chain. A listener that returns
     /// without calling `next` vetoes the default behavior.
+    ///
+    /// `once` listeners are removed when the dispatch starts, so they take
+    /// part in this chain (its snapshot keeps them alive) but never in a later
+    /// dispatch. Within one dispatch a `once` link runs at most once, even if
+    /// an upstream listener calls [`Next::next`] more than once.
     pub fn waterfall<E: WaterfallEvent>(
         &self,
         args: E::Args,
         default: impl Fn(E::Args) -> LocalBoxFuture<'static, E::Out> + 'static,
     ) -> LocalBoxFuture<'static, E::Out> {
         let key = EventKey::new::<E>(EventKind::Waterfall);
-        let chain: Rc<Vec<WaterfallFn<E>>> = Rc::new(
-            self.snapshot::<WaterfallFn<E>>(key)
+        let slots = self.snapshot::<WaterfallFn<E>>(key);
+
+        // Remove once listeners up front; the chain below owns its own clones
+        // so they still run in this dispatch. This also covers the veto case:
+        // once removed, the listener never runs on a later dispatch.
+        self.remove_once(key, &slots);
+
+        let chain: Rc<Vec<WaterfallLink<E>>> = Rc::new(
+            slots
                 .into_iter()
-                .map(|slot| slot.f.clone())
+                .map(|slot| {
+                    Rc::new(WaterfallLinkInner {
+                        once: slot.once.get(),
+                        fired: Cell::new(false),
+                        f: slot.f.clone(),
+                    })
+                })
                 .collect(),
         );
         let default: Rc<dyn Fn(E::Args) -> LocalBoxFuture<'static, E::Out>> = Rc::new(default);
-        Box::pin(async move {
-            if chain.is_empty() {
-                default(args).await
-            } else {
-                let next = Next {
-                    chain: chain.clone(),
-                    index: 1,
-                    default,
-                };
-                (chain[0])(args, next).await
-            }
-        })
+        run_waterfall_chain(chain, 0, args, default)
     }
+}
+
+type WaterfallLink<E> = Rc<WaterfallLinkInner<E>>;
+
+struct WaterfallLinkInner<E: WaterfallEvent> {
+    once: bool,
+    /// Per-dispatch flag; the chain is rebuilt for every dispatch.
+    fired: Cell<bool>,
+    f: WaterfallFn<E>,
+}
+
+fn run_waterfall_chain<E: WaterfallEvent>(
+    chain: Rc<Vec<WaterfallLink<E>>>,
+    start: usize,
+    args: E::Args,
+    default: Rc<dyn Fn(E::Args) -> LocalBoxFuture<'static, E::Out>>,
+) -> LocalBoxFuture<'static, E::Out> {
+    Box::pin(async move {
+        let mut index = start;
+        while let Some(link) = chain.get(index) {
+            if link.once && link.fired.replace(true) {
+                index += 1;
+                continue;
+            }
+            let next = Next {
+                chain: chain.clone(),
+                index: index + 1,
+                default: default.clone(),
+            };
+            return (link.f)(args, next).await;
+        }
+        default(args).await
+    })
 }
 
 /// Continuation passed to a `waterfall` listener.
 pub struct Next<E: WaterfallEvent> {
-    chain: Rc<Vec<WaterfallFn<E>>>,
+    chain: Rc<Vec<WaterfallLink<E>>>,
     index: usize,
     default: Rc<dyn Fn(E::Args) -> LocalBoxFuture<'static, E::Out>>,
 }
@@ -320,21 +386,7 @@ pub struct Next<E: WaterfallEvent> {
 impl<E: WaterfallEvent> Next<E> {
     /// Run the next listener (or the built-in default at the end of the chain).
     pub fn next(&self, args: E::Args) -> LocalBoxFuture<'static, E::Out> {
-        let chain = self.chain.clone();
-        let index = self.index;
-        let default = self.default.clone();
-        Box::pin(async move {
-            if let Some(listener) = chain.get(index) {
-                let next = Next {
-                    chain: chain.clone(),
-                    index: index + 1,
-                    default,
-                };
-                (listener)(args, next).await
-            } else {
-                default(args).await
-            }
-        })
+        run_waterfall_chain(self.chain.clone(), self.index, args, self.default.clone())
     }
 }
 

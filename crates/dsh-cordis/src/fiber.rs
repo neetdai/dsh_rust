@@ -7,7 +7,7 @@ use futures::channel::oneshot;
 
 use crate::plugin::PluginError;
 use crate::registry::Registry;
-use crate::service::ServiceKey;
+use crate::service::ServiceKeyId;
 
 /// Unique fiber id inside one registry. The root fiber is `0`.
 pub type FiberId = u64;
@@ -88,7 +88,7 @@ pub(crate) struct FiberInner {
     pub(crate) id: FiberId,
     pub(crate) parent: Option<FiberId>,
     pub(crate) status: Cell<FiberStatus>,
-    pub(crate) inject: Vec<ServiceKey>,
+    pub(crate) inject: Vec<ServiceKeyId>,
     pub(crate) effects: RefCell<Vec<Rc<EffectEntry>>>,
     pub(crate) children: RefCell<Vec<FiberId>>,
     pub(crate) tasks: RefCell<Vec<AbortHandle>>,
@@ -97,7 +97,7 @@ pub(crate) struct FiberInner {
 }
 
 impl FiberInner {
-    pub(crate) fn new(id: FiberId, parent: Option<FiberId>, inject: Vec<ServiceKey>) -> Self {
+    pub(crate) fn new(id: FiberId, parent: Option<FiberId>, inject: Vec<ServiceKeyId>) -> Self {
         Self {
             id,
             parent,

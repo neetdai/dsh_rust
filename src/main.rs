@@ -8,7 +8,7 @@ struct Greeter {
     name: String,
 }
 
-const GREETER: ServiceKey = ServiceKey::new("greeter");
+const GREETER: ServiceKey<Greeter> = ServiceKey::new("greeter");
 
 fn main() {
     let runtime: Rc<dyn Runtime> = Rc::new(TokioRuntime::new().expect("build tokio runtime"));
@@ -27,7 +27,7 @@ fn main() {
         let consumer = FnPlugin::new("consumer", |ctx, _config| {
             Box::pin(async move {
                 let greeter = ctx
-                    .require::<Greeter>(GREETER)
+                    .require(GREETER)
                     .map_err(|error| PluginError::new(error.to_string()))?;
                 println!("[consumer] hello, {}!", greeter.name);
                 Ok(())
